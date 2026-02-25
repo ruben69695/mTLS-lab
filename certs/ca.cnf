@@ -1,0 +1,21 @@
+# ca.cnf — OpenSSL configuration for the local Certificate Authority
+[ req ]
+default_bits       = 4096
+prompt             = no
+default_md         = sha256
+distinguished_name = dn
+x509_extensions    = v3_ca
+
+[ dn ]
+C  = US
+ST = Local
+L  = Lab
+O  = mTLS Lab CA
+OU = Security
+CN = mTLS Lab Root CA
+
+[ v3_ca ]
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid:always,issuer
+basicConstraints       = critical, CA:true
+keyUsage               = critical, digitalSignature, cRLSign, keyCertSign
