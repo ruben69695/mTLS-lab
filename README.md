@@ -41,8 +41,8 @@ openssl version  # e.g. OpenSSL 3.x or LibreSSL 3.x
 
 ### Operating System
 
-- **macOS** (tested on macOS 14+) or **Linux** (Ubuntu 22.04+, Fedora 38+)
-- A POSIX shell (`bash` or `zsh`) for running the cert generation script
+- **macOS** (tested on macOS 14+) or **Linux** (Ubuntu 22.04+, Fedora 38+) or **Windows 11**
+- A POSIX shell (`bash`, `zsh`, `powershell`) for running the cert generation script
 
 ---
 
@@ -62,12 +62,13 @@ mtls-lab/
 │   ├── client.cnf          # Client certificate configuration
 │   ├── client.crt          # Client certificate (signed by CA)
 │   ├── client.key          # Client private key
+│   ├── client.pfx          # Client PFX: a container that includes the certificate, private key, and full certificate chain, prepared for import locally or into IvSign.
 │   ├── client.csr          # Client CSR (intermediate)
 │   └── gen_certs.sh        # Script that generates all of the above
 ├── server/
-│   └── server.py           # mTLS HTTPS server (GET /todo)
+│   └── server.py           # mTLS HTTPS server (GET /todo, POST /todo)
 └── client/
-    ├── client.py           # mTLS HTTPS client (with client cert)
+    ├── client.py           # mTLS HTTPS client (POST /todo, then GET /todo)
     └── client_no_cert.py   # Negative test — connection without client cert
 ```
 
@@ -79,11 +80,11 @@ mtls-lab/
 
 ### Why SAN and EKU are mandatory
 
-| Extension | Purpose | What breaks without it |
-|-----------|---------|------------------------|
+| Extension                          | Purpose                                                            | What breaks without it                                                                   |
+| ---------------------------------- | ------------------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
 | **SAN** (Subject Alternative Name) | Binds the certificate to hostnames/IPs the server actually runs on | Modern TLS stacks (Python `ssl`, Go, Chrome) reject certs without SAN even if CN matches |
-| **EKU serverAuth** | Signals that the cert may be used to authenticate a server | Python's `ssl` module will reject a server cert without this OID |
-| **EKU clientAuth** | Signals that the cert may be used to authenticate a client | Servers enforcing mTLS will reject a client cert without this OID |
+| **EKU serverAuth**                 | Signals that the cert may be used to authenticate a server         | Python's `ssl` module will reject a server cert without this OID                         |
+| **EKU clientAuth**                 | Signals that the cert may be used to authenticate a client         | Servers enforcing mTLS will reject a client cert without this OID                        |
 
 ### Step 0 — Use the provided script (recommended)
 
@@ -203,6 +204,20 @@ openssl x509 \
   -extfile certs/client.cnf
 ```
 
+### Step 7 — Export the client certificate as PFX
+
+```bash
+openssl pkcs12 -export \
+  -out certs/client.pfx \
+  -inkey certs/client.key \
+  -in certs/client.crt \
+  -certfile certs/ca.crt
+```
+
+This bundles the client certificate, the client private key, and the CA certificate into a single `.pfx` file.
+
+OpenSSL will prompt you for an export password to protect the `.pfx` file.
+
 ---
 
 ### Verifying the certificates
@@ -243,7 +258,7 @@ No external packages are required. The server uses only the Python standard libr
 ```
 http.server  — BaseHTTPRequestHandler, HTTPServer
 ssl          — SSLContext, CERT_REQUIRED, TLSVersion
-json         — response serialization
+json         — request/response serialization
 pathlib      — certificate path resolution
 ```
 
@@ -265,11 +280,11 @@ ctx.load_cert_chain(certfile="certs/server.crt", keyfile="certs/server.key")
 ctx.minimum_version = ssl.TLSVersion.TLSv1_2
 ```
 
-| Flag | Effect |
-|------|--------|
+| Flag            | Effect                                                                       |
+| --------------- | ---------------------------------------------------------------------------- |
 | `CERT_REQUIRED` | Server **demands** a client certificate; handshake fails if none is provided |
-| `CERT_OPTIONAL` | Server accepts but does not require a client cert |
-| `CERT_NONE` | Server ignores client certificates entirely (standard one-way TLS) |
+| `CERT_OPTIONAL` | Server accepts but does not require a client cert                            |
+| `CERT_NONE`     | Server ignores client certificates entirely (standard one-way TLS)           |
 
 ### Reading the client certificate on the server
 
@@ -279,11 +294,70 @@ After the handshake, `self.connection.getpeercert()` returns a dictionary with t
 cert = self.connection.getpeercert()
 # Example:
 # {
-#   'subject': ((('commonName', 'mtls-client'),),),
-#   'issuer':  ((('commonName', 'mTLS Lab Root CA'),),),
+#   'subject': ((('commonName', 'mtls-client'),),,),
+#   'issuer':  ((('commonName', 'mTLS Lab Root CA'),),,),
 #   'notAfter': 'Feb 25 00:00:00 2026 GMT',
 #   ...
 # }
+```
+
+### Exposed endpoints
+
+The server now exposes two authenticated endpoints:
+
+| Method | Path    | Description                            |
+| ------ | ------- | -------------------------------------- |
+| `GET`  | `/todo` | Returns the current TODO list          |
+| `POST` | `/todo` | Creates a new TODO item and returns it |
+
+### POST request body
+
+`POST /todo` expects a JSON body like this:
+
+```json
+{
+  "task": "Añadir endpoint POST",
+  "done": false
+}
+```
+
+Validation rules:
+
+* `task` must be a non-empty string
+* `done` is optional and defaults to `false`
+* if provided, `done` must be a boolean
+
+### POST response
+
+On success, the server responds with `HTTP 201 Created`:
+
+```json
+{
+  "client": "mtls-client",
+  "message": "TODO item created",
+  "todo": {
+    "id": 6,
+    "task": "Añadir endpoint POST",
+    "done": false
+  }
+}
+```
+
+### GET response
+
+`GET /todo` returns the authenticated client CN plus the current list:
+
+```json
+{
+  "client": "mtls-client",
+  "todos": [
+    {
+      "id": 1,
+      "task": "Set up local CA",
+      "done": true
+    }
+  ]
+}
 ```
 
 ### Running the server
@@ -298,6 +372,28 @@ Expected output:
 [SERVER] mTLS server listening on https://127.0.0.1:8443
 [SERVER] Requiring client cert signed by: ca.crt
 [SERVER] Press Ctrl+C to stop.
+```
+
+### Running the server with Docker
+
+Build the image from the project root using the `Dockerfile`:
+
+```bash
+docker build -f Dockerfile -t <dockerhub-user>/mtls-server:latest .
+```
+
+Run the container exposing the HTTPS port:
+
+```bash
+docker run -d --rm --name mtls-server -p 8443:8443 <dockerhub-user>/mtls-server:latest
+```
+
+The container sets `MTLS_SERVER_HOST=0.0.0.0` by default so the service is reachable through Docker port publishing.
+
+To publish the image to Docker Hub:
+
+```bash
+docker push <dockerhub-user>/mtls-server:latest
 ```
 
 ---
@@ -330,6 +426,13 @@ opener  = urllib.request.build_opener(handler)
 opener.open(url)
 ```
 
+### Client flow
+
+The client now performs two authenticated requests in sequence:
+
+1. `POST /todo` — creates a new TODO item
+2. `GET /todo` — fetches the updated TODO list including the newly created item
+
 ### Running the client
 
 Open a **second terminal** (server must be running):
@@ -342,7 +445,7 @@ python3 client/client.py
 
 ## 6. Testing Scenarios
 
-### ✅ Successful mTLS call
+### ✅ Successful mTLS call with POST then GET
 
 **Terminal 1 — Start the server:**
 
@@ -363,7 +466,21 @@ python3 client/client.py
 [CLIENT] Client cert: client.crt
 [CLIENT] CA trust:    ca.crt
 
-[CLIENT] Authenticated as: 'mtls-client'
+[CLIENT] Creating new TODO with POST /todo ...
+[CLIENT] POST response (HTTP 201):
+
+{
+  "client": "mtls-client",
+  "message": "TODO item created",
+  "todo": {
+    "id": 6,
+    "task": "Añadir endpoint POST",
+    "done": false
+  }
+}
+
+[CLIENT] Fetching TODO list with GET /todo ...
+[CLIENT] Authenticated as: "mtls-client"
 [CLIENT] Response (HTTP 200):
 
 {
@@ -373,7 +490,8 @@ python3 client/client.py
     {"id": 2, "task": "Issue server certificate", "done": true},
     {"id": 3, "task": "Issue client certificate", "done": true},
     {"id": 4, "task": "Configure mTLS server",    "done": true},
-    {"id": 5, "task": "Validate mutual auth",     "done": false}
+    {"id": 5, "task": "Validate mutual auth",     "done": false},
+    {"id": 6, "task": "Añadir endpoint POST",     "done": false}
   ]
 }
 ```
@@ -381,8 +499,39 @@ python3 client/client.py
 **Expected server output (stderr):**
 
 ```
-[SERVER] 127.0.0.1 (cert CN='mtls-client') "GET /todo HTTP/1.1" 200 -
-[SERVER] Authenticated client CN: 'mtls-client'
+[SERVER] REQUEST | peer=127.0.0.1 | cert-CN='mtls-client' | "POST /todo HTTP/1.1" 201 -
+[SERVER] AUTHENTICATED | CN='mtls-client' | creating TODO
+[SERVER] TODO CREATED | CN='mtls-client' | item={'id': 6, 'task': 'Añadir endpoint POST', 'done': False}
+
+[SERVER] REQUEST | peer=127.0.0.1 | cert-CN='mtls-client' | "GET /todo HTTP/1.1" 200 -
+[SERVER] AUTHENTICATED | CN='mtls-client' | serving /todo
+```
+
+### Manual POST test with curl
+
+You can also test the new endpoint manually:
+
+```bash
+curl --cert certs/client.crt \
+     --key certs/client.key \
+     --cacert certs/ca.crt \
+     -X POST https://127.0.0.1:8443/todo \
+     -H "Content-Type: application/json" \
+     -d '{"task":"Añadir endpoint POST","done":false}'
+```
+
+Expected response:
+
+```json
+{
+  "client": "mtls-client",
+  "message": "TODO item created",
+  "todo": {
+    "id": 6,
+    "task": "Añadir endpoint POST",
+    "done": false
+  }
+}
 ```
 
 ---
@@ -414,7 +563,7 @@ The server's `ssl.CERT_REQUIRED` setting instructs OpenSSL to send a `Certificat
 - `certificate_required` (TLS 1.3, RFC 8446 §6.2)
 - `handshake_failure` (TLS 1.2)
 
-The TCP connection is torn down before any HTTP data is exchanged. The `GET /todo` request is **never sent**.
+The TCP connection is torn down before any HTTP data is exchanged. Neither the `POST /todo` nor the `GET /todo` request is ever sent.
 
 **Verifying via OpenSSL s_client (alternative negative test):**
 
@@ -454,7 +603,7 @@ Client                                    Server
   |                                          |
   |<─── Finished ────────────────────────────|
   |                                          |
-  |==== Encrypted application data ==========|  ← GET /todo
+  |==== Encrypted application data ==========|  ← POST /todo, GET /todo
 ```
 
 **Where client authentication occurs:** Between `CertificateRequest` and `Finished`. The client signs a digest of the handshake transcript using its private key (`CertificateVerify`). The server verifies the signature against the public key in the client certificate, then verifies the certificate chain back to the trusted CA.
@@ -465,18 +614,21 @@ The private key is used only to sign (`CertificateVerify`). The signature can be
 
 ### Common mistakes in mTLS setups
 
-| Mistake | Consequence | Fix |
-|---------|-------------|-----|
-| Missing SAN in server cert | Python `ssl` raises `ssl.CertificateError: hostname mismatch` | Add `subjectAltName` to server cert config |
-| Missing `clientAuth` EKU in client cert | Server rejects cert during handshake | Add `extendedKeyUsage = clientAuth` to client cert config |
-| SAN in CSR but not in signed cert | Extensions silently dropped | Always pass `-extensions … -extfile …` to `openssl x509 -req` |
-| `CERT_OPTIONAL` instead of `CERT_REQUIRED` | Clients can connect without any certificate | Use `CERT_REQUIRED` on the server |
-| Using system CA store for client verification | Client accepts **any** CA-signed server cert | Explicitly `load_verify_locations(cafile=…)` with your CA only |
-| Committing private keys to git | Key compromise | Add `certs/*.key` to `.gitignore` |
-| Sharing one cert between all clients | Cannot revoke individual clients | Issue one certificate per client identity |
-| Not checking `getpeercert()` fields | Any cert from the trusted CA is accepted | Validate CN, OU, or SAN fields to enforce authorization, not just authentication |
+| Mistake                                       | Consequence                                                   | Fix                                                                              |
+| --------------------------------------------- | ------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| Missing SAN in server cert                    | Python `ssl` raises `ssl.CertificateError: hostname mismatch` | Add `subjectAltName` to server cert config                                       |
+| Missing `clientAuth` EKU in client cert       | Server rejects cert during handshake                          | Add `extendedKeyUsage = clientAuth` to client cert config                        |
+| SAN in CSR but not in signed cert             | Extensions silently dropped                                   | Always pass `-extensions … -extfile …` to `openssl x509 -req`                    |
+| `CERT_OPTIONAL` instead of `CERT_REQUIRED`    | Clients can connect without any certificate                   | Use `CERT_REQUIRED` on the server                                                |
+| Using system CA store for client verification | Client accepts **any** CA-signed server cert                  | Explicitly `load_verify_locations(cafile=…)` with your CA only                   |
+| Committing private keys to git                | Key compromise                                                | Add `certs/*.key` to `.gitignore`                                                |
+| Sharing one cert between all clients          | Cannot revoke individual clients                              | Issue one certificate per client identity                                        |
+| Not checking `getpeercert()` fields           | Any cert from the trusted CA is accepted                      | Validate CN, OU, or SAN fields to enforce authorization, not just authentication |
 
 ### Authentication vs. Authorization
 
 mTLS provides **authentication** (who are you?) — it proves the client holds the private key for a certificate signed by the trusted CA. It does **not** automatically provide **authorization** (what are you allowed to do?). In production, always check the certificate subject fields after the handshake to enforce access control at the application layer.
-# mTLS-lab
+
+### Note about persistence
+
+In this lab, TODO items are stored in memory only. That means items created with `POST /todo` are lost when the server restarts. For a production service, you would persist them in a database or file-backed store.

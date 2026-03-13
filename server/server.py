@@ -6,6 +6,7 @@ import datetime
 import hashlib
 import json
 import logging
+import os
 import ssl
 import sys
 import traceback
@@ -15,8 +16,8 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-HOST = "127.0.0.1"
-PORT = 8443
+HOST = os.getenv("MTLS_SERVER_HOST", "127.0.0.1")
+PORT = int(os.getenv("MTLS_SERVER_PORT", "8443"))
 
 CERTS_DIR = Path(__file__).parent.parent / "certs"
 CA_CERT    = CERTS_DIR / "ca.crt"
@@ -293,11 +294,85 @@ class MTLSHandler(BaseHTTPRequestHandler):
         else:
             self._send_json(404, {"error": f"Not found: {self.path}"})
 
+    def do_POST(self):
+        self._log_request_headers()
+        if self.path == "/todo":
+            self._handle_create_todo()
+        else:
+            self._send_json(404, {"error": f"Not found: {self.path}"})
+
     def _handle_todo(self):
         client_cert = self.connection.getpeercert()
         subject     = _extract_cn(client_cert)
         log.info("AUTHENTICATED | CN=%r | serving /todo", subject)
         self._send_json(200, {"client": subject, "todos": TODO_ITEMS})
+
+    def _handle_create_todo(self):
+        client_cert = self.connection.getpeercert()
+        subject     = _extract_cn(client_cert)
+        log.info("AUTHENTICATED | CN=%r | creating TODO", subject)
+
+        try:
+            payload = self._read_json_body()
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+
+        task = payload.get("task")
+        done = payload.get("done", False)
+
+        if not isinstance(task, str) or not task.strip():
+            self._send_json(400, {"error": "'task' must be a non-empty string"})
+            return
+
+        if not isinstance(done, bool):
+            self._send_json(400, {"error": "'done' must be a boolean"})
+            return
+
+        new_id = max((item["id"] for item in TODO_ITEMS), default=0) + 1
+        new_item = {
+            "id": new_id,
+            "task": task.strip(),
+            "done": done,
+        }
+        TODO_ITEMS.append(new_item)
+
+        log.info("TODO CREATED | CN=%r | item=%s", subject, new_item)
+        self._send_json(201, {
+            "client": subject,
+            "message": "TODO item created",
+            "todo": new_item,
+        })
+
+    def _read_json_body(self) -> dict:
+        content_length = self.headers.get("Content-Length")
+        if not content_length:
+            raise ValueError("Missing Content-Length header")
+
+        try:
+            length = int(content_length)
+        except ValueError:
+            raise ValueError("Invalid Content-Length header")
+
+        raw_body = self.rfile.read(length)
+        if not raw_body:
+            raise ValueError("Request body is empty")
+
+        content_type = self.headers.get("Content-Type", "")
+        if "application/json" not in content_type:
+            raise ValueError("Content-Type must be application/json")
+
+        try:
+            data = json.loads(raw_body.decode("utf-8"))
+        except UnicodeDecodeError:
+            raise ValueError("Request body must be valid UTF-8")
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON: {exc.msg}")
+
+        if not isinstance(data, dict):
+            raise ValueError("JSON body must be an object")
+
+        return data
 
     def _send_json(self, status: int, payload: dict):
         body = json.dumps(payload, indent=2).encode()

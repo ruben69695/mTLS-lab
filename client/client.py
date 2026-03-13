@@ -1,6 +1,6 @@
 """
 client.py — mTLS HTTPS client
-Presents a client certificate to the server and calls GET /todo.
+Presents a client certificate to the server, calls POST /todo, then GET /todo.
 """
 import json
 import ssl
@@ -46,21 +46,46 @@ def build_ssl_context() -> ssl.SSLContext:
 
 
 # ---------------------------------------------------------------------------
-# Request
+# HTTP helpers
 # ---------------------------------------------------------------------------
+def build_opener() -> urllib.request.OpenerDirector:
+    """Build an HTTPS opener using the mTLS SSL context."""
+    ctx = build_ssl_context()
+    handler = urllib.request.HTTPSHandler(context=ctx)
+    return urllib.request.build_opener(handler)
+
+
+def create_todo(task: str, done: bool = False) -> dict:
+    """Perform authenticated POST /todo and return parsed JSON."""
+    opener = build_opener()
+
+    payload = json.dumps({
+        "task": task,
+        "done": done,
+    }).encode("utf-8")
+
+    request = urllib.request.Request(
+        SERVER_URL,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    with opener.open(request, timeout=10) as response:
+        raw = response.read()
+        data = json.loads(raw)
+
+    return data
+
+
 def get_todos() -> dict:
     """Perform authenticated GET /todo and return parsed JSON."""
-    ctx     = build_ssl_context()
-    handler = urllib.request.HTTPSHandler(context=ctx)
-    opener  = urllib.request.build_opener(handler)
-
-    print(f"[CLIENT] Connecting to {SERVER_URL}")
-    print(f"[CLIENT] Client cert: {CLIENT_CERT.name}")
-    print(f"[CLIENT] CA trust:    {CA_CERT.name}\n")
+    opener = build_opener()
 
     with opener.open(SERVER_URL, timeout=10) as response:
-        raw  = response.read()
+        raw = response.read()
         data = json.loads(raw)
+
     return data
 
 
@@ -73,8 +98,27 @@ def main():
             sys.exit(f"[ERROR] Missing file: {path}\n"
                      "Run 'bash certs/gen_certs.sh' first.")
 
+    print(f"[CLIENT] Connecting to {SERVER_URL}")
+    print(f"[CLIENT] Client cert: {CLIENT_CERT.name}")
+    print(f"[CLIENT] CA trust:    {CA_CERT.name}\n")
+
     try:
+        print("[CLIENT] Creating new TODO with POST /todo ...")
+        created = create_todo("Put the cookies in the moon", True)
+
+        print("[CLIENT] POST response (HTTP 201):\n")
+        print(json.dumps(created, indent=2))
+        print()
+
+        print("[CLIENT] Fetching TODO list with GET /todo ...")
         data = get_todos()
+
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        print(f"[CLIENT] HTTP error: {exc.code} {exc.reason}", file=sys.stderr)
+        if error_body:
+            print(error_body, file=sys.stderr)
+        sys.exit(1)
     except urllib.error.URLError as exc:
         print(f"[CLIENT] Connection failed: {exc.reason}", file=sys.stderr)
         sys.exit(1)
